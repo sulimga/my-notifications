@@ -84,10 +84,12 @@ CHECK_INTERVAL_MINUTES = 15
 OFFERS_LIST_URL = "https://rieltor.ua/api/offers/list/"
 OFFERS_LIST_PARAMS = {
     "page": 1,
-    "limit": 25,
+    "limit": 100,   # максимум оголошень на одній сторінці запиту
     "status": 10,   # 10 = активні оголошення
-    "itemType": 1,  # 1 = квартири
     "mode": 10,
+    # itemType навмисно НЕ вказаний - тоді API повертає всі типи
+    # нерухомості одразу (квартири, будинки, комерцію), а не тільки
+    # один конкретний тип.
 }
 
 # Файл, де зберігається попередній стан оголошень (щоб не спамити
@@ -136,23 +138,51 @@ def save_state(state: dict) -> None:
 
 
 def fetch_offers() -> list[dict]:
-    """Робить запит до rieltor.ua і повертає список оголошень."""
+    """
+    Робить запити до rieltor.ua і повертає ПОВНИЙ список оголошень,
+    автоматично проходячи всі сторінки пагінації (навіть якщо
+    оголошень більше, ніж поміщається на одну сторінку).
+    """
     headers = dict(HEADERS)
     headers["cookie"] = RIELTOR_COOKIE
 
-    response = requests.get(
-        OFFERS_LIST_URL,
-        params=OFFERS_LIST_PARAMS,
-        headers=headers,
-        timeout=30,
-    )
-    response.raise_for_status()
+    all_items: list[dict] = []
+    page = 1
 
-    payload = response.json()
-    if payload.get("status") != "OK":
-        raise RuntimeError(f"Неочікувана відповідь API: {payload}")
+    while True:
+        params = dict(OFFERS_LIST_PARAMS)
+        params["page"] = page
 
-    return payload["data"]["items"]
+        response = requests.get(
+            OFFERS_LIST_URL,
+            params=params,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        if payload.get("status") != "OK":
+            raise RuntimeError(f"Неочікувана відповідь API: {payload}")
+
+        data = payload["data"]
+        all_items.extend(data["items"])
+
+        pagination = data.get("pagination", {})
+        page_count = pagination.get("pageCount", 1)
+
+        log.info(
+            "Завантажено сторінку %s з %s (%s оголошень на ній).",
+            page,
+            page_count,
+            len(data["items"]),
+        )
+
+        if page >= page_count:
+            break
+        page += 1
+
+    return all_items
 
 
 def send_telegram_message(text: str) -> None:
