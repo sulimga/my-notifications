@@ -2,16 +2,28 @@
 LUN Representability Monitor
 =============================
 
-Скрипт періодично перевіряє список твоїх оголошень на rieltor.ua
-і слідкує за полем "representability":
+Скрипт перевіряє список твоїх ПЛАТНИХ оголошень на rieltor.ua і
+дивиться на поле "representability":
     1 -> ти представник на ЛУН (є медалька)
     2 (або будь-що інше, крім 1) -> тебе перебили конкуренти
 
-При зміні статусу з "представник" на "не представник" надсилає
-сповіщення в Telegram.
+ЛОГІКА СПОВІЩЕНЬ (проста і надійна):
+    - Якщо ВСІ платні оголошення є представниками -> сповіщення
+      НЕ надсилається (тиша).
+    - Якщо ХОЧА Б ОДНЕ платне оголошення НЕ є представником ->
+      надсилається сповіщення в Telegram зі списком таких оголошень.
+    - Це відбувається на КОЖНІЙ перевірці, а не тільки при зміні
+      статусу. Тобто поки оголошення лишається "не представником",
+      сповіщення надходитиме щоразу (кожні ~15 хв, чи як налаштовано
+      розклад у GitHub Actions) - це зроблено НАВМИСНО, щоб не
+      пропустити ситуацію, коли тебе перебили і встигли повернути
+      позицію назад між двома перевірками.
+    - Безкоштовні оголошення (де немає платної ставки, dailyCost=0)
+      ІГНОРУЮТЬСЯ - по них немає сенсу перевіряти представництво,
+      бо там немає аукціону ставок.
 
 НАЛАШТУВАННЯ (обов'язково заповни перед запуском):
-    1. RIELTOR_COOKIE   - рядок cookies з твого браузера (див. інструкцію нижче)
+    1. RIELTOR_COOKIE     - рядок cookies з твого браузера (див. інструкцію нижче)
     2. TELEGRAM_BOT_TOKEN - токен твого Telegram-бота
     3. TELEGRAM_CHAT_ID   - твій chat_id (кому надсилати повідомлення)
 
@@ -53,13 +65,10 @@ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID. Це потрібно для GitHub Action
 середовища, або просто вписати значення в константи нижче.
 """
 
-import json
 import os
 import sys
 import time
 import logging
-from datetime import datetime
-from pathlib import Path
 
 import requests
 
@@ -92,10 +101,6 @@ OFFERS_LIST_PARAMS = {
     # один конкретний тип.
 }
 
-# Файл, де зберігається попередній стан оголошень (щоб не спамити
-# повідомленнями і бачити тільки ЗМІНИ статусу)
-STATE_FILE = Path(__file__).parent / "lun_monitor_state.json"
-
 # ============================================================
 # Технічна частина - зазвичай не потребує змін
 # ============================================================
@@ -118,23 +123,6 @@ HEADERS = {
 }
 
 REPRESENTABILITY_OK = 1  # ти головний на ЛУН
-
-
-def load_state() -> dict:
-    """Завантажує попередній збережений стан оголошень з диску."""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning("Не вдалось прочитати файл стану: %s", exc)
-    return {}
-
-
-def save_state(state: dict) -> None:
-    """Зберігає поточний стан оголошень на диск."""
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
 
 
 def fetch_offers() -> list[dict]:
@@ -208,61 +196,64 @@ def format_offer_line(offer: dict) -> str:
     return f"{offer['address']} ({offer['price']})"
 
 
-def check_once(previous_state: dict) -> dict:
+def is_paid_offer(offer: dict) -> bool:
     """
-    Робить один прохід перевірки: тягне список оголошень, порівнює
-    зі старим станом, надсилає сповіщення при зміні, повертає новий стан.
+    Платне оголошення визначаємо по dailyCost > 0.
+    Безкоштовні (тариф "free") мають dailyCost == 0 - там немає
+    аукціону ставок, тому representability для них не перевіряємо.
+    """
+    return (offer.get("dailyCost") or 0) > 0
+
+
+def check_once() -> None:
+    """
+    Один прохід перевірки: тягне ВЕСЬ список оголошень і, якщо серед
+    платних є хоч одне НЕ представник - надсилає одне сповіщення
+    в Telegram зі списком усіх таких оголошень. Якщо всі платні
+    оголошення представники - нічого не надсилає.
     """
     offers = fetch_offers()
-    new_state = {}
-    changes = []
+
+    not_representative = []
 
     for offer in offers:
-        offer_id = str(offer["id"])
+        if not is_paid_offer(offer):
+            log.info("%s -> (безкоштовне, пропускаємо)", format_offer_line(offer))
+            continue
+
         representability = offer.get("representability")
         is_representative = representability == REPRESENTABILITY_OK
 
-        new_state[offer_id] = {
-            "address": offer["address"],
-            "price": offer["price"],
-            "representability": representability,
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
-        }
+        log.info(
+            "%s -> %s",
+            format_offer_line(offer),
+            "✅ представник" if is_representative else "❌ НЕ представник",
+        )
 
-        prev = previous_state.get(offer_id)
-        prev_representability = prev["representability"] if prev else None
+        if not is_representative:
+            not_representative.append(offer)
 
-        # Перше запам'ятовування стану - не сповіщаємо, просто фіксуємо
-        if prev is None:
-            log.info(
-                "%s -> %s",
-                format_offer_line(offer),
-                "✅ представник" if is_representative else "❌ НЕ представник",
-            )
-            continue
+    if not not_representative:
+        log.info("Усі платні оголошення є представниками на ЛУН. Сповіщення не потрібне.")
+        return
 
-        # Зміна: був представником, а тепер ні
-        if prev_representability == REPRESENTABILITY_OK and not is_representative:
-            changes.append(
-                f"❌ <b>Втратив позицію представника на ЛУН</b>\n"
-                f"{format_offer_line(offer)}\n"
-                f"<a href=\"{offer.get('lunUrl', '')}\">Відкрити на ЛУН</a>"
-            )
-            log.warning("ВТРАТА позиції: %s", format_offer_line(offer))
+    lines = [
+        "⚠️ <b>Оголошення НЕ є представником на ЛУН:</b>",
+        "",
+    ]
+    for offer in not_representative:
+        lun_url = offer.get("lunUrl", "")
+        lines.append(
+            f"❌ {format_offer_line(offer)}\n"
+            f"<a href=\"{lun_url}\">Відкрити на ЛУН</a>"
+        )
 
-        # Зміна: не був представником, а тепер знову так
-        elif prev_representability != REPRESENTABILITY_OK and is_representative:
-            changes.append(
-                f"✅ <b>Знову представник на ЛУН</b>\n"
-                f"{format_offer_line(offer)}"
-            )
-            log.info("Відновлення позиції: %s", format_offer_line(offer))
-
-    if changes:
-        message = "\n\n".join(changes)
-        send_telegram_message(message)
-
-    return new_state
+    message = "\n\n".join(lines)
+    send_telegram_message(message)
+    log.warning(
+        "Надіслано сповіщення про %s оголошень без представництва.",
+        len(not_representative),
+    )
 
 
 def _check_config() -> bool:
@@ -281,10 +272,8 @@ def run_once() -> None:
     if not _check_config():
         sys.exit(1)
 
-    state = load_state()
     try:
-        state = check_once(state)
-        save_state(state)
+        check_once()
         log.info("Перевірка завершена успішно.")
     except requests.RequestException as exc:
         log.error("Помилка запиту до rieltor.ua: %s", exc)
@@ -301,12 +290,9 @@ def run_forever() -> None:
         CHECK_INTERVAL_MINUTES,
     )
 
-    state = load_state()
-
     while True:
         try:
-            state = check_once(state)
-            save_state(state)
+            check_once()
         except requests.RequestException as exc:
             log.error("Помилка запиту до rieltor.ua: %s", exc)
         except Exception as exc:  # noqa: BLE001 - навмисно широкий except у циклі
