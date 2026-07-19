@@ -256,6 +256,15 @@ def check_once() -> None:
     )
 
 
+def notify_error(message: str) -> None:
+    """
+    Логує помилку і одразу пише про неї в Telegram - щоб мовчання
+    скрипта завжди означало "все ок", а не "щось зламалось непомітно".
+    """
+    log.error(message)
+    send_telegram_message(f"🔴 <b>Помилка моніторингу ЛУН</b>\n{message}")
+
+
 def _check_config() -> bool:
     if "PASTE_YOUR" in RIELTOR_COOKIE or "PASTE_YOUR" in TELEGRAM_BOT_TOKEN:
         log.error(
@@ -267,6 +276,26 @@ def _check_config() -> bool:
     return True
 
 
+def _describe_exception(exc: Exception) -> str:
+    """Перетворює технічну помилку на зрозуміле повідомлення для людини."""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        if status in (401, 403):
+            return (
+                f"Сайт rieltor.ua відповів помилкою авторизації (HTTP {status}).\n"
+                "Найімовірніша причина - протух RIELTOR_COOKIE.\n"
+                "Онови його: зайди в кабінет rieltor.ua, дістань свіжий cookie "
+                "(DevTools -> Network -> Headers -> Cookie) і онови секрет "
+                "RIELTOR_COOKIE в GitHub → Settings → Secrets and variables → Actions."
+            )
+        return f"Сайт rieltor.ua відповів помилкою HTTP {status}."
+
+    if isinstance(exc, requests.RequestException):
+        return f"Не вдалось з'єднатися з rieltor.ua: {exc}"
+
+    return f"Неочікувана помилка в скрипті: {exc}"
+
+
 def run_once() -> None:
     """Один прохід перевірки - саме цей режим використовує GitHub Actions."""
     if not _check_config():
@@ -275,8 +304,8 @@ def run_once() -> None:
     try:
         check_once()
         log.info("Перевірка завершена успішно.")
-    except requests.RequestException as exc:
-        log.error("Помилка запиту до rieltor.ua: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - навмисно широкий except, щоб нічого не пропустити
+        notify_error(_describe_exception(exc))
         sys.exit(1)
 
 
@@ -293,10 +322,8 @@ def run_forever() -> None:
     while True:
         try:
             check_once()
-        except requests.RequestException as exc:
-            log.error("Помилка запиту до rieltor.ua: %s", exc)
         except Exception as exc:  # noqa: BLE001 - навмисно широкий except у циклі
-            log.exception("Неочікувана помилка: %s", exc)
+            notify_error(_describe_exception(exc))
 
         time.sleep(CHECK_INTERVAL_MINUTES * 60)
 
