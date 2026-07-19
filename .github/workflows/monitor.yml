@@ -1,12 +1,12 @@
-name: LUN Representability Monitor
+name: Listing Status Monitor
 
 # Коли запускати:
-# 1. "schedule" - автоматично, за розкладом (cron), кожні 15 хвилин.
+# 1. "schedule" - автоматично, за розкладом (cron), кожні 5 хвилин.
 # 2. "workflow_dispatch" - вручну, кнопкою "Run workflow" на GitHub
-#    (зручно для тесту, щоб не чекати 15 хвилин).
+#    (зручно для тесту, щоб не чекати розклад).
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -26,7 +26,9 @@ jobs:
 
       - name: Запустити перевірку
         env:
-          RIELTOR_COOKIE: ${{ secrets.RIELTOR_COOKIE }}
+          SITE_COOKIE: ${{ secrets.SITE_COOKIE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          SITE_CABINET_URL: ${{ secrets.SITE_CABINET_URL }}
         run: python lun_monitor.py --once
