@@ -1,3 +1,74 @@
+"""
+Paid Listing Representative-Status Monitor
+============================================
+
+Скрипт перевіряє список твоїх ПЛАТНИХ оголошень на сайті-джерелі
+(URL заданий через секрет SITE_BASE_URL) і дивиться на поле
+"representability" у відповіді API:
+    1 -> ти представник (позиція утримана)
+    2 (або будь-що інше, крім 1) -> тебе перебили конкуренти
+
+ЛОГІКА СПОВІЩЕНЬ (проста і надійна):
+    - Якщо ВСІ платні оголошення є представниками -> сповіщення
+      НЕ надсилається (тиша).
+    - Якщо ХОЧА Б ОДНЕ платне оголошення НЕ є представником ->
+      надсилається сповіщення в Telegram зі списком таких оголошень.
+    - Це відбувається на КОЖНІЙ перевірці, а не тільки при зміні
+      статусу. Тобто поки оголошення лишається "не представником",
+      сповіщення надходитиме щоразу (кожні кілька хвилин, як
+      налаштовано розклад у GitHub Actions) - це зроблено НАВМИСНО,
+      щоб не пропустити ситуацію, коли тебе перебили і встигли
+      повернути позицію назад між двома перевірками.
+    - Безкоштовні оголошення (де немає платної ставки, dailyCost=0)
+      ІГНОРУЮТЬСЯ - по них немає сенсу перевіряти представництво,
+      бо там немає аукціону ставок.
+
+НАЛАШТУВАННЯ (обов'язково заповни перед запуском - через GitHub
+Secrets, а НЕ прямо в цьому файлі, якщо репозиторій публічний):
+    1. SITE_COOKIE     - рядок cookies з твого браузера
+    2. TELEGRAM_BOT_TOKEN - токен твого Telegram-бота
+    3. TELEGRAM_CHAT_ID   - твій chat_id (кому надсилати повідомлення)
+    4. SITE_BASE_URL      - базовий домен API, напр. https://example.com
+    5. SITE_CABINET_URL   - домен кабінету, напр. https://my.example.com
+
+ЯК ОТРИМАТИ SITE_COOKIE:
+    1. Зайди у свій кабінет під власним акаунтом.
+    2. Відкрий DevTools (F12) -> вкладка Network -> Fetch/XHR.
+    3. Онови сторінку, клікни на будь-який запит до API
+       (наприклад "list/" або "users/info/").
+    4. У вкладці Headers знайди розділ "Request Headers" -> "cookie".
+    5. Скопіюй ВЕСЬ рядок cookie (він довгий, це нормально) і встав
+       його як значення секрету SITE_COOKIE.
+
+    !! Це чутливі дані, що дають доступ до твого акаунту.
+       Нікому їх не показуй і не публікуй в репозиторіях.
+
+ЯК ОТРИМАТИ TELEGRAM BOT TOKEN І CHAT ID:
+    1. Напиши @BotFather в Telegram -> /newbot -> отримаєш токен.
+    2. Напиши своєму новому боту будь-яке повідомлення (просто "hi").
+    3. Відкрий у браузері:
+       https://api.telegram.org/bot<ТВІЙ_ТОКЕН>/getUpdates
+       і знайди там "chat":{"id": ЦИФРИ, ...} - це і є твій chat_id.
+
+ДВА РЕЖИМИ ЗАПУСКУ:
+
+    1) Локально, для тесту (постійний цикл, працює поки відкритий термінал):
+        pip install -r requirements.txt --break-system-packages
+        python3 lun_monitor.py
+
+    2) Одноразово (для GitHub Actions чи Windows Task Scheduler,
+       які самі викликають скрипт за розкладом):
+        python3 lun_monitor.py --once
+
+У режимі --once усі секретні дані (cookie, токен бота, chat_id,
+базові URL) беруться зі змінних середовища (environment variables).
+Це потрібно для GitHub Actions, щоб не зберігати чутливі дані прямо
+в коді - важливо, якщо репозиторій публічний.
+
+Для локального запуску (режим 1) можна або так само задати змінні
+середовища, або просто вписати значення в константи нижче.
+"""
+
 import os
 import sys
 import time
@@ -11,19 +82,23 @@ import requests
 # Спочатку скрипт шукає значення в змінних середовища (env vars) -
 # це потрібно для GitHub Actions. Якщо їх немає - бере значення
 # нижче (зручно для локального тесту у VSCode).
+#
+# .strip() прибирає випадкові пробіли/переноси рядків на початку
+# або в кінці значення - це часта причина помилок при копіюванні
+# cookie чи токена в поле секрету на GitHub.
 
-SITE_COOKIE = os.environ.get("SITE_COOKIE", "PASTE_YOUR_COOKIE_STRING_HERE")
+SITE_COOKIE = os.environ.get("SITE_COOKIE", "PASTE_YOUR_COOKIE_STRING_HERE").strip()
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PASTE_YOUR_CHAT_ID_HERE")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PASTE_YOUR_CHAT_ID_HERE").strip()
 
 # Базовий домен сайту-джерела - теж винесений у секрет/env, а не
 # прописаний прямо в коді. Це зроблено спеціально для публічного
 # репозиторію: щоб простий пошук на GitHub за назвою домену не
 # знаходив цей код. Значення виду "https://example.com" (без
 # слеша в кінці).
-SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "PASTE_YOUR_SITE_BASE_URL_HERE")
-SITE_CABINET_URL = os.environ.get("SITE_CABINET_URL", "PASTE_YOUR_SITE_CABINET_URL_HERE")
+SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "PASTE_YOUR_SITE_BASE_URL_HERE").strip()
+SITE_CABINET_URL = os.environ.get("SITE_CABINET_URL", "PASTE_YOUR_SITE_CABINET_URL_HERE").strip()
 
 # Як часто перевіряти (у хвилинах) - стосується ТІЛЬКИ локального
 # режиму з нескінченним циклом. Для GitHub Actions інтервал
