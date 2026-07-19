@@ -3,18 +3,18 @@
     "address": "Велика Васильківська вул. (Червоноармійська), 28",
     "price": "275 000 $",
     "representability": 1,
-    "checked_at": "2026-07-19T13:40:12"
+    "checked_at": "2026-07-19T13:52:14"
   },
   "12876366": {
     "address": "В'ячеслава Чорновола вул., 25",
     "price": "1 300 $/міс",
     "representability": 1,
-    "checked_at": "2026-07-19T13:40:12"
+    "checked_at": "2026-07-19T13:52:14"
   },
   "12859443": {
     "address": "Саперне Поле вул., 14/55",
     "price": "345 000 $",
-    "representability": 1,
-    "checked_at": "2026-07-19T13:40:12"
+    "representability": 2,
+    "checked_at": "2026-07-19T13:52:14"
   }
 }
