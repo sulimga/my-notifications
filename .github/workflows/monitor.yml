@@ -31,4 +31,4 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
           SITE_CABINET_URL: ${{ secrets.SITE_CABINET_URL }}
-        run: python lun_monitor.py --once
+        run: python listing_monitor.py --once
