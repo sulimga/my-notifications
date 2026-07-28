@@ -1,13 +1,19 @@
 name: Listing Status Monitor
 
 # Коли запускати:
-# 1. "schedule" - автоматично, за розкладом (cron), кожні 5 хвилин.
-# 2. "workflow_dispatch" - вручну, кнопкою "Run workflow" на GitHub
-#    (зручно для тесту, щоб не чекати розклад).
+# "workflow_dispatch" - вручну АБО через зовнішній виклик API
+# (саме так це і використовується: cron-job.org стукає в GitHub API
+# кожні 5 хвилин через цей самий тригер). Внутрішній "schedule"
+# GitHub навмисно НЕ використовується - він виявився ненадійним
+# (запуски могли затримуватись на години), тому таймер повністю
+# передано зовнішньому сервісу cron-job.org.
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
+
+# Потрібно, щоб workflow міг закомітити назад маленький файл
+# monitor_error_state.json (лічильник підряд невдалих запусків).
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -32,3 +38,12 @@ jobs:
           SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
           SITE_CABINET_URL: ${{ secrets.SITE_CABINET_URL }}
         run: python listing_monitor.py --once
+
+      - name: Зберегти лічильник підряд помилок назад у репозиторій
+        if: always()
+        run: |
+          git config user.name "listing-monitor-bot"
+          git config user.email "actions@github.com"
+          git add monitor_error_state.json
+          git diff --quiet --cached || git commit -m "Оновлення лічильника помилок"
+          git push
