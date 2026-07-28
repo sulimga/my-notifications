@@ -69,6 +69,7 @@ Secrets, а НЕ прямо в цьому файлі, якщо репозито�
 середовища, або просто вписати значення в константи нижче.
 """
 
+import json
 import os
 import sys
 import time
@@ -104,6 +105,25 @@ SITE_CABINET_URL = os.environ.get("SITE_CABINET_URL", "PASTE_YOUR_SITE_CABINET_U
 # режиму з нескінченним циклом. Для GitHub Actions інтервал
 # налаштовується в файлі .github/workflows/monitor.yml
 CHECK_INTERVAL_MINUTES = 15
+
+# Скільки РАЗІВ поспіль пробувати підключитись до сайту-джерела
+# в МЕЖАХ ОДНОГО запуску, перш ніж визнати спробу невдалою.
+# Це рятує від короткочасних "затиків" (наприклад, невдала IP-адреса
+# конкретного сервера GitHub Actions), коли повторна спроба через
+# кілька секунд вже проходить успішно.
+RETRY_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 10
+
+# Скільки запусків ПОСПІЛЬ мають закінчитись помилкою (навіть після
+# усіх повторних спроб вище), перш ніж надсилати сповіщення в
+# Telegram. Це другий рівень захисту від "хибних тривог": одна
+# ізольована невдача просто мовчки записується, і тільки якщо
+# проблема триває довше - приходить сповіщення.
+CONSECUTIVE_FAILURES_BEFORE_NOTIFY = 2
+
+# Файл, де зберігається лічильник підряд невдалих запусків. НЕ
+# зберігає нічого про самі оголошення - тільки маленьке число.
+ERROR_STATE_FILE = "monitor_error_state.json"
 
 # Параметри списку оголошень (як у запиті з браузера)
 OFFERS_LIST_PARAMS = {
@@ -271,6 +291,52 @@ def check_once() -> None:
     )
 
 
+def load_consecutive_failures() -> int:
+    """Читає, скільки разів поспіль скрипт вже впав перед цим запуском."""
+    try:
+        with open(ERROR_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("consecutive_failures", 0)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return 0
+
+
+def save_consecutive_failures(count: int) -> None:
+    """Зберігає поточний лічильник підряд невдалих запусків."""
+    try:
+        with open(ERROR_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"consecutive_failures": count}, f)
+    except OSError as exc:
+        log.warning("Не вдалось зберегти файл стану помилок: %s", exc)
+
+
+def check_once_with_retry() -> None:
+    """
+    Виконує check_once() з кількома повторними спробами в межах
+    ОДНОГО запуску, якщо перша спроба провалилась через мережеву
+    помилку. Це прибирає більшість короткочасних "затиків" ще до
+    того, як вони взагалі стануть видимими зовні.
+    """
+    last_exception: Exception | None = None
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            check_once()
+            return
+        except Exception as exc:  # noqa: BLE001 - навмисно широкий except
+            last_exception = exc
+            if attempt < RETRY_ATTEMPTS:
+                log.warning(
+                    "Спроба %s з %s невдала (%s). Повторюю через %s сек...",
+                    attempt,
+                    RETRY_ATTEMPTS,
+                    exc,
+                    RETRY_DELAY_SECONDS,
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+
+    raise last_exception
+
+
 def notify_error(message: str) -> None:
     """
     Логує помилку і одразу пише про неї в Telegram - щоб мовчання
@@ -326,10 +392,31 @@ def run_once() -> None:
         sys.exit(1)
 
     try:
-        check_once()
+        check_once_with_retry()
         log.info("Перевірка завершена успішно.")
+
+        # Успіх - скидаємо лічильник підряд невдач на нуль.
+        if load_consecutive_failures() > 0:
+            log.info("Проблема з попередніх запусків зникла, скидаю лічильник помилок.")
+        save_consecutive_failures(0)
+
     except Exception as exc:  # noqa: BLE001 - навмисно широкий except, щоб нічого не пропустити
-        notify_error(_describe_exception(exc))
+        failures = load_consecutive_failures() + 1
+        save_consecutive_failures(failures)
+
+        if failures >= CONSECUTIVE_FAILURES_BEFORE_NOTIFY:
+            notify_error(
+                f"{_describe_exception(exc)}\n\n"
+                f"(Це вже {failures}-й запуск поспіль з помилкою.)"
+            )
+        else:
+            log.warning(
+                "Запуск невдалий (%s з %s поспіль перед сповіщенням): %s",
+                failures,
+                CONSECUTIVE_FAILURES_BEFORE_NOTIFY,
+                exc,
+            )
+
         sys.exit(1)
 
 
@@ -345,7 +432,7 @@ def run_forever() -> None:
 
     while True:
         try:
-            check_once()
+            check_once_with_retry()
         except Exception as exc:  # noqa: BLE001 - навмисно широкий except у циклі
             notify_error(_describe_exception(exc))
 
