@@ -15,14 +15,11 @@ Paid Listing Rate Auto-Bidder + Representative-Status Monitor
            причина: конкурент підключив фіксоване представництво
            "ЛУН ТОП", і жодна ставка це не перебʼє) - ставка
            скидається до 0, не витрачаючи монети даремно.
-        3. Інакше - ставка піднімається до representabilityRate + 1,
-           але НЕ ВИЩЕ MAX_RATE_CEILING (захист від нескінченної
-           цінової гонки з конкурентом, який задирає ставку занадто
-           високо).
-        4. Якщо навіть на стелі representabilityRate все одно вищий -
-           ставка виставляється рівно на стелю (це максимум, який ми
-           готові платити), і в сповіщенні окремо позначається, що
-           представництва так і не досягнуто.
+        3. Інакше - ставка піднімається до representability_rate + 1.
+        4. Якщо навіть representability_rate конкурента вже >= MAX_RATE_CEILING
+           (за замовчуванням 60) - боротись занадто дорого, тому ставка
+           теж скидається до 0, а НЕ виставляється на стелю (платити
+           максимум і все одно програвати немає сенсу).
 
     Оголошення, де представництво вже утримується, НЕ чіпаються
     (ставка не знижується автоматично, навіть якщо є запас).
@@ -265,12 +262,16 @@ def is_paid_offer(offer: dict) -> bool:
 def decide_new_rate(current_rate: int, representability_rate: int) -> int:
     """
     Рахує, яку ставку виставити:
-    - representability_rate == 0 -> 0 (боротись марно/нема сенсу)
-    - інакше -> representability_rate + 1, але не вище MAX_RATE_CEILING
+    - representability_rate == 0 -> 0 (боротись марно/нема сенсу, напр. ЛУН ТОП конкурента)
+    - representability_rate >= MAX_RATE_CEILING -> 0 (конкурент задер ставку занадто
+      високо — платити стелю все одно без результату немає сенсу, здаємось повністю)
+    - інакше -> representability_rate + 1
     """
     if representability_rate <= 0:
         return 0
-    return min(representability_rate + 1, MAX_RATE_CEILING)
+    if representability_rate >= MAX_RATE_CEILING:
+        return 0
+    return representability_rate + 1
 
 
 def check_once() -> list[dict]:
@@ -307,10 +308,10 @@ def check_once() -> list[dict]:
             reason = "конкурент підключив ЛУН ТОП — представництво недосяжне ставкою"
         elif representability_rate <= 0:
             reason = "немає конкуренції за представництво"
+        elif representability_rate >= MAX_RATE_CEILING:
+            reason = f"конкурент тримає {representability_rate} (≥{MAX_RATE_CEILING}) — здаємось, це занадто дорого"
         else:
             reason = f"конкурент тримає ставку {representability_rate}"
-
-        hit_ceiling = representability_rate > MAX_RATE_CEILING
 
         if new_rate != current_rate:
             set_pickup_rate(offer_id, new_rate)
@@ -324,7 +325,6 @@ def check_once() -> list[dict]:
                 "new_rate": new_rate,
                 "representability_rate": representability_rate,
                 "reason": reason,
-                "hit_ceiling": hit_ceiling,
             })
         else:
             log.info(
@@ -342,11 +342,10 @@ def send_rate_changes_notification(changes: list[dict]) -> None:
     for change in changes:
         offer = change["offer"]
         aggregator_url = offer.get("lunUrl", "")
-        ceiling_note = " ⚠️ стеля 60, представництва все одно нема" if change["hit_ceiling"] else ""
         lines.append(
             f"🔁 {format_offer_line(offer)}\n"
             f"Ставка: {change['old_rate']} → {change['new_rate']} "
-            f"({change['reason']}){ceiling_note}\n"
+            f"({change['reason']})\n"
             f"<a href=\"{aggregator_url}\">Відкрити оголошення</a>"
         )
 
