@@ -254,7 +254,7 @@ def send_telegram_message(text: str) -> None:
 
 
 def format_offer_line(offer: dict) -> str:
-    return f"{offer['address']} ({offer['price']})"
+    return f"{offer['id']} {offer['address']} ({offer['price']})"
 
 
 def is_paid_offer(offer: dict) -> bool:
