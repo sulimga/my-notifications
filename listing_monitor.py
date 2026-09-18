@@ -294,22 +294,30 @@ def is_zero_rate_allowed(item_type_id: int, oper_type_id: int) -> bool:
 
 
 def decide_new_rate(current_rate: int, representability_rate: int, min_allowed_rate: int,
-                     max_ceiling: int, zero_allowed: bool):
+                     max_ceiling: int, zero_allowed: bool, lun_top_blocked: bool):
     """
     Рахує, яку ставку виставити. Повертає число, АБО None, якщо ставку
-    взагалі чіпати не можна/не варто (категорія забороняє 0, а ми якраз
-    хочемо здатись — тоді краще нічого не міняти, ніж намагатись).
+    взагалі не чіпаємо (нема причини ані піднімати, ані здаватись).
 
-    - немає конкуренції АБО конкурент понад стелею -> "здаємось":
-        - якщо 0 дозволений для цієї категорії -> min_allowed_rate (як
-          правило 0, дає сам сайт)
-        - якщо 0 заборонений (квартири, будинки-продаж) -> None,
-          нічого не міняємо
-    - інакше -> представник+1, але не нижче min_allowed_rate
+    Раз користувач сам поставив ставку > 0 — він увійшов у гонку за
+    представництво і залишається в ній, ПОКИ САМ не вирішить інакше.
+    "Здатись" (опустити ставку) можна лише з двох конкретних причин:
+        - конкурент підключив ЛУН ТОП (представництво взагалі недосяжне)
+        - конкурент тримає ставку на/понад стелею категорії (задорого)
+    "Немає конкурентів зараз" — це НЕ причина знижувати ставку: завтра
+    конкурент може з'явитись знову, і ми не хочемо втратити представництво
+    в проміжку між перевірками. (Окрема логіка "здешевлення раз на добу,
+    коли конкурентів нема" — окреме завдання на майбутнє, не тут.)
     """
-    give_up = representability_rate <= 0 or representability_rate >= max_ceiling
+    too_expensive = representability_rate >= max_ceiling
+    give_up = lun_top_blocked or too_expensive
+
     if give_up:
         return min_allowed_rate if zero_allowed else None
+
+    if representability_rate <= 0:
+        return None  # нема конкурентів -> тримаємо поточну ставку, нічого не міняємо
+
     return max(representability_rate + 1, min_allowed_rate)
 
 
@@ -359,22 +367,33 @@ def check_once() -> list[dict]:
         disabled_reason = info.get("isLunTopPublicationDisabledReason")
         min_allowed_rate = info.get("params", {}).get("minRentaRate", 0) or 0
 
-        new_rate = decide_new_rate(current_rate, representability_rate, min_allowed_rate, max_ceiling, zero_allowed)
+        lun_top_blocked = disabled_reason == LUN_TOP_BLOCKED_REASON
+        new_rate = decide_new_rate(current_rate, representability_rate, min_allowed_rate,
+                                    max_ceiling, zero_allowed, lun_top_blocked)
 
-        if disabled_reason == LUN_TOP_BLOCKED_REASON:
+        give_up = lun_top_blocked or representability_rate >= max_ceiling
+
+        if lun_top_blocked:
             reason = "конкурент підключив ЛУН ТОП — представництво недосяжне ставкою"
-        elif representability_rate <= 0:
-            reason = "немає конкуренції за представництво"
         elif representability_rate >= max_ceiling:
             reason = f"конкурент тримає {representability_rate} (≥{max_ceiling}) — здаємось, це занадто дорого"
+        elif representability_rate <= 0:
+            reason = "немає конкуренції за представництво"
         else:
             reason = f"конкурент тримає ставку {representability_rate}"
 
         if new_rate is None:
-            # категорія забороняє ставку 0, а ми якраз хочемо здатись ->
-            # нічого не міняємо, тільки повідомляємо (і будемо повідомляти
-            # знову щоразу, поки конкурент не опуститься сам або стеля не
-            # перестане перевищуватись)
+            if not give_up:
+                # немає конкурентів, і здаватись не треба -> тримаємо поточну
+                # ставку мовчки, це нормальний, непомітний стан, не сповіщення
+                log.info(
+                    "%s -> ставка лишається %s (%s)",
+                    format_offer_line(offer), current_rate, reason,
+                )
+                continue
+            # здаємось, але категорія забороняє ставку 0 -> нічого не міняємо,
+            # тільки повідомляємо (і будемо повідомляти знову щоразу, поки
+            # ситуація не зміниться)
             blocked_reason = reason + " — для цієї категорії ставка 0 заборонена, тому лишаю поточну і нічого не змінюю"
             log.info("%s -> %s", format_offer_line(offer), blocked_reason)
             changes.append({
