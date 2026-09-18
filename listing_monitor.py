@@ -307,7 +307,7 @@ def decide_new_rate(current_rate: int, representability_rate: int, min_allowed_r
     "Немає конкурентів зараз" — це НЕ причина знижувати ставку: завтра
     конкурент може з'явитись знову, і ми не хочемо втратити представництво
     в проміжку між перевірками. (Окрема логіка "здешевлення раз на добу,
-    коли конкурентів нема" — окреме завдання на майбутнє, не тут.)
+    коли конкурентів нема" винесена в окремий скрипт lun_monitor_night.py.)
     """
     too_expensive = representability_rate >= max_ceiling
     give_up = lun_top_blocked or too_expensive
