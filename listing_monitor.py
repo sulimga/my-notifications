@@ -342,6 +342,19 @@ def check_once() -> list[dict]:
         info = fetch_pickup_info(offer_id)
 
         current_rate = info["form"]["rate"]
+
+        # Авторитетна перевірка: поле "rate" у списку (яким ми фільтрували
+        # вище) інколи буває застарілим/іншим за реальну ставку з
+        # pickup-item. Якщо тут виявляється, що насправді 0 — користувач
+        # НЕ бере участі в аукціоні, і ми НЕ ЧІПАЄМО це оголошення, хай
+        # там що показав список.
+        if current_rate <= 0:
+            log.info(
+                "%s -> насправді ставка 0 (список показав інше) — не чіпаємо",
+                format_offer_line(offer),
+            )
+            continue
+
         representability_rate = info.get("representabilityRate", 0)
         disabled_reason = info.get("isLunTopPublicationDisabledReason")
         min_allowed_rate = info.get("params", {}).get("minRentaRate", 0) or 0
