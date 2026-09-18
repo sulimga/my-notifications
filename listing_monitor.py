@@ -84,7 +84,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PASTE_YOUR_CHAT_ID_HERE")
 SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "PASTE_YOUR_SITE_BASE_URL_HERE").strip()
 SITE_CABINET_URL = os.environ.get("SITE_CABINET_URL", "PASTE_YOUR_SITE_CABINET_URL_HERE").strip()
 
-CHECK_INTERVAL_MINUTES = 15
+CHECK_INTERVAL_MINUTES = 5
 
 RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 10
@@ -201,8 +201,11 @@ def fetch_pickup_info(offer_id: int) -> dict:
     return payload["data"]
 
 
-def set_pickup_rate(offer_id: int, rate: int) -> None:
-    """Виставляє нову ставку для оголошення."""
+def set_pickup_rate(offer_id: int, rate: int) -> dict:
+    """Виставляє нову ставку для оголошення. Повертає розібраний JSON
+    відповіді (навіть у разі помилки status=ERROR) — виклик сам вирішує,
+    чи це критична помилка, чи очікуваний відомий сценарій (напр. заборона
+    опускати ставку нижче базової)."""
     headers = dict(HEADERS)
     headers["cookie"] = SITE_COOKIE
     headers["content-type"] = "application/json"
@@ -225,10 +228,7 @@ def set_pickup_rate(offer_id: int, rate: int) -> None:
         timeout=30,
     )
     response.raise_for_status()
-
-    result = response.json()
-    if result.get("status") != "OK":
-        raise RuntimeError(f"Не вдалось встановити ставку {rate} для {offer_id}: {result}")
+    return response.json()
 
 
 def send_telegram_message(text: str) -> None:
@@ -255,33 +255,71 @@ def format_offer_line(offer: dict) -> str:
 
 
 def is_paid_offer(offer: dict) -> bool:
-    """Платне оголошення визначаємо по dailyCost > 0."""
-    return (offer.get("dailyCost") or 0) > 0
+    """
+    Платне оголошення (тобто таке, де користувач сам вирішив брати участь
+    у боротьбі за представництво) визначаємо по rate > 0 — це саме той
+    показник, який видно і в кабінеті, і його ж ми самі змінюємо.
+    (dailyCost НЕ підходить для цього — трапляються оголошення з rate > 0,
+    де dailyCost чомусь показує 0, тож орієнтуємось саме на rate.)
+    """
+    return (offer.get("rate") or 0) > 0
 
 
-def decide_new_rate(current_rate: int, representability_rate: int) -> int:
+def get_max_ceiling(item_type_id: int, oper_type_id: int) -> int:
     """
-    Рахує, яку ставку виставити:
-    - representability_rate == 0 -> 0 (боротись марно/нема сенсу, напр. ЛУН ТОП конкурента)
-    - representability_rate >= MAX_RATE_CEILING -> 0 (конкурент задер ставку занадто
-      високо — платити стелю все одно без результату немає сенсу, здаємось повністю)
-    - інакше -> representability_rate + 1
+    Стеля ставки — вище якої здаємось незалежно від того, що тримає
+    конкурент. Різні категорії мають кардинально різні масштаби цін:
+    - квартири (будь-яка угода) - дуже конкурентний сегмент, стеля 1380
+    - будинки на ПРОДАЖ - теж високі ставки, стеля 1060
+    - усе інше (комерція, оренда будинків, земля, і все не уточнене) - 60
     """
-    if representability_rate <= 0:
-        return 0
-    if representability_rate >= MAX_RATE_CEILING:
-        return 0
-    return representability_rate + 1
+    if item_type_id == 1:  # квартира
+        return 1380
+    if item_type_id == 3 and oper_type_id == 1:  # будинок, продаж
+        return 1060
+    return MAX_RATE_CEILING  # комерція / оренда будинків / земля / дефолт
+
+
+def is_zero_rate_allowed(item_type_id: int, oper_type_id: int) -> bool:
+    """
+    Чи можна для цієї категорії взагалі поставити ставку 0.
+    Ні для: квартир (будь-яка угода) і будинків на ПРОДАЖ.
+    Так для всього іншого (комерція, оренда будинків, земля тощо).
+    """
+    if item_type_id == 1:  # квартира
+        return False
+    if item_type_id == 3 and oper_type_id == 1:  # будинок, продаж
+        return False
+    return True
+
+
+def decide_new_rate(current_rate: int, representability_rate: int, min_allowed_rate: int,
+                     max_ceiling: int, zero_allowed: bool):
+    """
+    Рахує, яку ставку виставити. Повертає число, АБО None, якщо ставку
+    взагалі чіпати не можна/не варто (категорія забороняє 0, а ми якраз
+    хочемо здатись — тоді краще нічого не міняти, ніж намагатись).
+
+    - немає конкуренції АБО конкурент понад стелею -> "здаємось":
+        - якщо 0 дозволений для цієї категорії -> min_allowed_rate (як
+          правило 0, дає сам сайт)
+        - якщо 0 заборонений (квартири, будинки-продаж) -> None,
+          нічого не міняємо
+    - інакше -> представник+1, але не нижче min_allowed_rate
+    """
+    give_up = representability_rate <= 0 or representability_rate >= max_ceiling
+    if give_up:
+        return min_allowed_rate if zero_allowed else None
+    return max(representability_rate + 1, min_allowed_rate)
 
 
 def check_once() -> list[dict]:
     """
     Один прохід перевірки й автоматичного виправлення ставок.
 
-    Повертає список змін, які відбулись (або мали б відбутись, але
-    вперлись у стелю) - кожен елемент:
+    Повертає список змін (або заблокованих спроб) - кожен елемент:
         {"offer": ..., "old_rate": ..., "new_rate": ...,
-         "representability_rate": ..., "reason": ..., "hit_ceiling": bool}
+         "representability_rate": ..., "reason": ..., "blocked": bool}
     """
     offers = fetch_offers()
     changes = []
@@ -296,62 +334,111 @@ def check_once() -> list[dict]:
             continue
 
         offer_id = offer["id"]
+        item_type_id = offer.get("itemTypeId")
+        oper_type_id = offer.get("operTypeId")
+        max_ceiling = get_max_ceiling(item_type_id, oper_type_id)
+        zero_allowed = is_zero_rate_allowed(item_type_id, oper_type_id)
+
         info = fetch_pickup_info(offer_id)
 
         current_rate = info["form"]["rate"]
         representability_rate = info.get("representabilityRate", 0)
         disabled_reason = info.get("isLunTopPublicationDisabledReason")
+        min_allowed_rate = info.get("params", {}).get("minRentaRate", 0) or 0
 
-        new_rate = decide_new_rate(current_rate, representability_rate)
+        new_rate = decide_new_rate(current_rate, representability_rate, min_allowed_rate, max_ceiling, zero_allowed)
 
         if disabled_reason == LUN_TOP_BLOCKED_REASON:
             reason = "конкурент підключив ЛУН ТОП — представництво недосяжне ставкою"
         elif representability_rate <= 0:
             reason = "немає конкуренції за представництво"
-        elif representability_rate >= MAX_RATE_CEILING:
-            reason = f"конкурент тримає {representability_rate} (≥{MAX_RATE_CEILING}) — здаємось, це занадто дорого"
+        elif representability_rate >= max_ceiling:
+            reason = f"конкурент тримає {representability_rate} (≥{max_ceiling}) — здаємось, це занадто дорого"
         else:
             reason = f"конкурент тримає ставку {representability_rate}"
 
-        if new_rate != current_rate:
-            set_pickup_rate(offer_id, new_rate)
-            log.info(
-                "%s -> ставку змінено: %s -> %s (%s)",
-                format_offer_line(offer), current_rate, new_rate, reason,
-            )
+        if new_rate is None:
+            # категорія забороняє ставку 0, а ми якраз хочемо здатись ->
+            # нічого не міняємо, тільки повідомляємо (і будемо повідомляти
+            # знову щоразу, поки конкурент не опуститься сам або стеля не
+            # перестане перевищуватись)
+            blocked_reason = reason + " — для цієї категорії ставка 0 заборонена, тому лишаю поточну і нічого не змінюю"
+            log.info("%s -> %s", format_offer_line(offer), blocked_reason)
             changes.append({
                 "offer": offer,
                 "old_rate": current_rate,
-                "new_rate": new_rate,
+                "new_rate": current_rate,
                 "representability_rate": representability_rate,
-                "reason": reason,
+                "reason": blocked_reason,
+                "blocked": True,
             })
-        else:
+            continue
+
+        if new_rate == current_rate:
             log.info(
                 "%s -> ставка вже %s, зміна не потрібна (%s)",
                 format_offer_line(offer), current_rate, reason,
             )
+            continue
+
+        result = set_pickup_rate(offer_id, new_rate)
+
+        if result.get("status") != "OK":
+            # Категорія не дозволяє опустити ставку нижче за (щойно розрахований)
+            # мінімум — теоретично не мало б статись, раз ми й так орієнтуємось
+            # на minRentaRate, але лишаємо як запобіжник: не падаємо, а
+            # повідомляємо і лишаємо ставку без змін. Наступний прогін
+            # спробує знову і знову сповістить, поки ситуація не зміниться.
+            blocked_reason = reason + f" — сервер відхилив ставку {new_rate}, лишаю поточну ({result.get('error')})"
+            log.info("%s -> %s", format_offer_line(offer), blocked_reason)
+            changes.append({
+                "offer": offer,
+                "old_rate": current_rate,
+                "new_rate": current_rate,
+                "representability_rate": representability_rate,
+                "reason": blocked_reason,
+                "blocked": True,
+            })
+            continue
+
+        log.info(
+            "%s -> ставку змінено: %s -> %s (%s)",
+            format_offer_line(offer), current_rate, new_rate, reason,
+        )
+        changes.append({
+            "offer": offer,
+            "old_rate": current_rate,
+            "new_rate": new_rate,
+            "representability_rate": representability_rate,
+            "reason": reason,
+            "blocked": False,
+        })
 
     return changes
 
 
 def send_rate_changes_notification(changes: list[dict]) -> None:
-    """Формує і надсилає повідомлення про зміни ставок."""
+    """Формує і надсилає повідомлення про зміни ставок (і про заблоковані спроби)."""
     lines = ["📊 <b>Автоматична зміна ставок:</b>", ""]
 
     for change in changes:
         offer = change["offer"]
         aggregator_url = offer.get("lunUrl", "")
+        if change.get("blocked"):
+            icon = "⛔"
+            rate_line = f"Ставка залишається {change['old_rate']} монет (не вдалось знизити)"
+        else:
+            icon = "🔁"
+            rate_line = f"Ставка: {change['old_rate']} → {change['new_rate']}"
         lines.append(
-            f"🔁 {format_offer_line(offer)}\n"
-            f"Ставка: {change['old_rate']} → {change['new_rate']} "
-            f"({change['reason']})\n"
+            f"{icon} {format_offer_line(offer)}\n"
+            f"{rate_line} ({change['reason']})\n"
             f"<a href=\"{aggregator_url}\">Відкрити оголошення</a>"
         )
 
     message = "\n\n".join(lines)
     send_telegram_message(message)
-    log.warning("Надіслано сповіщення про %s змінених ставок.", len(changes))
+    log.warning("Надіслано сповіщення про %s змінених/заблокованих ставок.", len(changes))
 
 
 def load_state() -> dict:
